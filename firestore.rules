@@ -1,0 +1,124 @@
+rules_version = '2';
+
+// Isolamento multi-tenant:
+// - Cada usuário autenticado é um "cliente" (clientId == request.auth.uid).
+// - Todas as collections são de nível raiz (sem subcoleções) e todo documento
+//   carrega o campo `clientId`. Leitura e escrita só são permitidas quando o
+//   `clientId` do documento é o do usuário autenticado.
+// - `clientId` e `connectionId` são imutáveis após a criação.
+// - Contatos e mensagens só podem ser criados em conexões do próprio cliente.
+// - O status "sent" de mensagens agendadas é definido pelo backend
+//   (Cloud Function com Admin SDK, que não passa por estas regras).
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function uid() {
+      return request.auth.uid;
+    }
+
+    function ownsExisting() {
+      return signedIn() && resource.data.clientId == uid();
+    }
+
+    function ownsIncoming() {
+      return signedIn() && request.resource.data.clientId == uid();
+    }
+
+    function unchanged(field) {
+      return request.resource.data[field] == resource.data[field];
+    }
+
+    function ownsConnection(connectionId) {
+      let path = /databases/$(database)/documents/connections/$(connectionId);
+      return exists(path) && get(path).data.clientId == uid();
+    }
+
+    function validText(value, maxSize) {
+      return value is string && value.trim().size() > 0 && value.size() <= maxSize;
+    }
+
+    // ---------- clients ----------
+    match /clients/{clientId} {
+      allow read: if signedIn() && clientId == uid();
+      allow create, update: if signedIn() && clientId == uid()
+        && request.resource.data.keys().hasOnly(['name', 'email', 'createdAt']);
+      allow delete: if false;
+    }
+
+    // ---------- connections ----------
+    function validConnection() {
+      let d = request.resource.data;
+      return d.keys().hasOnly(['clientId', 'name', 'createdAt', 'updatedAt'])
+        && validText(d.name, 80);
+    }
+
+    match /connections/{connectionId} {
+      allow read, delete: if ownsExisting();
+      allow create: if ownsIncoming() && validConnection();
+      allow update: if ownsExisting() && validConnection()
+        && unchanged('clientId') && unchanged('createdAt');
+    }
+
+    // ---------- contacts ----------
+    function validContact() {
+      let d = request.resource.data;
+      return d.keys().hasOnly(['clientId', 'connectionId', 'name', 'phone', 'createdAt', 'updatedAt'])
+        && validText(d.name, 80)
+        && d.phone is string && d.phone.matches('^[0-9]{10,15}$');
+    }
+
+    match /contacts/{contactId} {
+      allow read, delete: if ownsExisting();
+      allow create: if ownsIncoming() && validContact()
+        && ownsConnection(request.resource.data.connectionId);
+      allow update: if ownsExisting() && validContact()
+        && unchanged('clientId') && unchanged('connectionId') && unchanged('createdAt');
+    }
+
+    // ---------- messages ----------
+    function validMessageFields() {
+      let d = request.resource.data;
+      return d.keys().hasOnly([
+          'clientId', 'connectionId', 'contactIds', 'body',
+          'status', 'scheduledAt', 'sentAt', 'createdAt', 'updatedAt'
+        ])
+        && validText(d.body, 2000)
+        && d.contactIds is list && d.contactIds.size() > 0 && d.contactIds.size() <= 500;
+    }
+
+    // Envio imediato (simulado): sentAt é o horário do servidor.
+    function sendingNow() {
+      return request.resource.data.status == 'sent'
+        && request.resource.data.sentAt == request.time;
+    }
+
+    // Agendamento: precisa estar no futuro e ainda não enviado.
+    function schedulingInFuture() {
+      let d = request.resource.data;
+      return d.status == 'scheduled' && d.scheduledAt is timestamp
+        && d.scheduledAt > request.time && d.sentAt == null;
+    }
+
+    // Edição de mensagem já enviada: status e horários não mudam.
+    function editingSent() {
+      return resource.data.status == 'sent'
+        && request.resource.data.status == 'sent'
+        && unchanged('sentAt') && unchanged('scheduledAt');
+    }
+
+    match /messages/{messageId} {
+      allow read, delete: if ownsExisting();
+      allow create: if ownsIncoming() && validMessageFields()
+        && (sendingNow() || schedulingInFuture())
+        && ownsConnection(request.resource.data.connectionId);
+      allow update: if ownsExisting() && validMessageFields()
+        && unchanged('clientId') && unchanged('connectionId') && unchanged('createdAt')
+        && (editingSent()
+            || (resource.data.status == 'scheduled' && (sendingNow() || schedulingInFuture())));
+    }
+  }
+}

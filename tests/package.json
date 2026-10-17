@@ -1,0 +1,12 @@
+{
+  "name": "broadcast-tests",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "test": "cd .. && npm --prefix functions run build && firebase emulators:exec --only firestore --project demo-test \"cd tests && node rules.test.mjs && node functions.test.cjs\""
+  },
+  "devDependencies": {
+    "@firebase/rules-unit-testing": "^4.0.1",
+    "firebase": "^11.0.1"
+  }
+}

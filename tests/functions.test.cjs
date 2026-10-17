@@ -1,0 +1,26 @@
+process.env.FIRESTORE_EMULATOR_HOST = "127.0.0.1:8080";
+process.env.GCLOUD_PROJECT = "demo-test";
+const fns = require("../functions/lib/index.js");
+const { getFirestore, Timestamp } = require(require.resolve("firebase-admin/firestore", { paths: [__dirname + "/../functions"] }));
+const db = getFirestore();
+let ok = 0, bad = 0;
+const check = (name, cond) => { console.log(cond ? "PASS" : "FAIL", name); cond ? ok++ : bad++; };
+(async () => {
+  const base = { clientId: "alice", connectionId: "c9", body: "Oi", sentAt: null };
+  await db.doc("messages/due").set({ ...base, contactIds: ["k9", "k8"], status: "scheduled", scheduledAt: Timestamp.fromMillis(Date.now() - 60e3) });
+  await db.doc("messages/later").set({ ...base, contactIds: ["k9"], status: "scheduled", scheduledAt: Timestamp.fromMillis(Date.now() + 3600e3) });
+  await fns.dispatchScheduledMessages.run({});
+  const due = (await db.doc("messages/due").get()).data(), later = (await db.doc("messages/later").get()).data();
+  check("agendada vencida vira Enviada", due.status === "sent" && due.sentAt);
+  check("agendada futura continua Agendada", later.status === "scheduled");
+  await fns.onContactDeleted.run({ params: { contactId: "k9" }, data: { get: () => "c9" } });
+  const due2 = await db.doc("messages/due").get(), later2 = await db.doc("messages/later").get();
+  check("contato excluido sai dos destinatarios", JSON.stringify(due2.data().contactIds) === '["k8"]');
+  check("mensagem sem destinatarios e removida", !later2.exists);
+  await db.doc("contacts/k8").set({ clientId: "alice", connectionId: "c9", name: "B", phone: "5561999990002" });
+  await fns.onConnectionDeleted.run({ params: { connectionId: "c9" } });
+  const left = (await db.collection("messages").where("connectionId", "==", "c9").get()).size + (await db.collection("contacts").where("connectionId", "==", "c9").get()).size;
+  check("excluir conexao remove contatos e mensagens", left === 0);
+  console.log(`\nFUNCTIONS: ${ok} passaram, ${bad} falharam`);
+  process.exit(bad ? 1 : 0);
+})().catch((e) => { console.error(e); process.exit(1); });
